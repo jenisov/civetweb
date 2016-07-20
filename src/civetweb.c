@@ -236,12 +236,32 @@ mg_static_assert(PATH_MAX >= 1, "path length must be a positive number");
 #include <direct.h>
 #include <io.h>
 #else          /* _WIN32_WCE */
+#include <altcecrt.h>
+#include <winbase.h>
+
 #define NO_CGI /* WinCE has no pipes */
+#define NO_POPEN
+
+/* WEC7/2013 unsupported yet */
+#define NO_SSL
+#define NO_CACHING
+#define NO_NONCE_CHECK
 
 typedef long off_t;
 
 #define errno ((int)(GetLastError()))
 #define strerror(x) (_ultoa(x, (char *)_alloca(sizeof(x) * 3), 10))
+
+static time_t
+time(time_t *ptime);
+static struct tm *
+localtime(const time_t *ptime);
+static struct tm *
+gmtime(const time_t *ptime);
+static size_t
+strftime(char *dst, size_t dst_size, const char *fmt, const struct tm *tm);
+static int rename(const char* oldname, const char* newname);
+
 #endif /* _WIN32_WCE */
 
 #define MAKEUQUAD(lo, hi)                                                      \
@@ -308,7 +328,11 @@ typedef long off_t;
 #define close(x) (_close(x))
 #define dlsym(x, y) (GetProcAddress((HINSTANCE)(x), (y)))
 #define RTLD_LAZY (0)
-#define fseeko(x, y, z) (_lseeki64(_fileno(x), (y), (z)) == -1 ? -1 : 0)
+#ifndef _WIN32_WCE
+#	define fseeko(x, y, z) (_lseeki64(_fileno(x), (y), (z)) == -1 ? -1 : 0)
+#else
+#	define fseeko(x, y, z) (fseek((x), (long)(y), (z)) == 0 ? 0 : -1)
+#endif
 #define fdopen(x, y) (_fdopen((x), (y)))
 #define write(x, y, z) (_write((x), (y), (unsigned)z))
 #define read(x, y, z) (_read((x), (y), (unsigned)z))
@@ -399,7 +423,11 @@ struct pollfd {
 
 /* Mark required libraries */
 #if defined(_MSC_VER)
-#pragma comment(lib, "Ws2_32.lib")
+#	if defined(_WIN32_WCE)
+#		pragma comment(lib, "Ws2.lib")
+#	else
+#		pragma comment(lib, "Ws2_32.lib")
+#	endif
 #endif
 
 #else /* defined(_WIN32) && !defined(__SYMBIAN32__) - WINDOWS / UNIX include   \
@@ -1528,7 +1556,9 @@ mg_fopen(const struct mg_connection *conn,
          const char *mode,
          struct file *filep)
 {
+#ifndef _WIN32_WCE
 	struct stat st;
+#endif
 
 	if (!filep) {
 		return 0;
@@ -1539,9 +1569,11 @@ mg_fopen(const struct mg_connection *conn,
 	 * the same structure (bad cohesion). */
 	memset(filep, 0, sizeof(*filep));
 
+#ifndef _WIN32_WCE
 	if (stat(path, &st) == 0) {
 		filep->size = (uint64_t)(st.st_size);
 	}
+#endif
 
 	if (!is_file_in_memory(conn, path, filep)) {
 #ifdef _WIN32
@@ -1549,6 +1581,9 @@ mg_fopen(const struct mg_connection *conn,
 		path_to_unicode(conn, path, wbuf, ARRAY_SIZE(wbuf));
 		MultiByteToWideChar(CP_UTF8, 0, mode, -1, wmode, ARRAY_SIZE(wmode));
 		filep->fp = _wfopen(wbuf, wmode);
+#	ifdef _WIN32_WCE
+		filep->size = GetFileSize((HANDLE) _fileno(filep->fp), NULL);
+#	endif
 #else
 		/* Linux et al already use unicode. No need to convert. */
 		filep->fp = fopen(path, mode);
@@ -1901,7 +1936,11 @@ mg_cry(const struct mg_connection *conn, const char *fmt, ...)
 	va_end(ap);
 	buf[sizeof(buf) - 1] = 0;
 
+#ifndef DEBUG
 	if (!conn) {
+#else
+	{
+#endif
 		puts(buf);
 		return;
 	}
@@ -2860,8 +2899,10 @@ path_to_unicode(const struct mg_connection *conn,
                 size_t wbuf_len)
 {
 	char buf[PATH_MAX], buf2[PATH_MAX];
+#ifndef _WIN32_WCE
 	wchar_t wbuf2[MAX_PATH + 1];
 	DWORD long_len, err;
+#endif
 	int (*fcompare)(const wchar_t *, const wchar_t *) = mg_wcscasecmp;
 
 	mg_strlcpy(buf, path, sizeof(buf));
@@ -2888,6 +2929,7 @@ path_to_unicode(const struct mg_connection *conn,
 	*/
 	(void)conn; /* conn is currently unused */
 
+#ifndef _WIN32_WCE /* TODO for WinCE */
 	/* Only accept a full file path, not a Windows short (8.3) path. */
 	memset(wbuf2, 0, ARRAY_SIZE(wbuf2) * sizeof(wchar_t));
 	long_len = GetLongPathNameW(wbuf, wbuf2, ARRAY_SIZE(wbuf2) - 1);
@@ -2902,8 +2944,8 @@ path_to_unicode(const struct mg_connection *conn,
 		/* Short name is used. */
 		wbuf[0] = L'\0';
 	}
+#endif
 }
-
 
 #if defined(_WIN32_WCE)
 /* Create substitutes for POSIX functions in Win32. */
@@ -2914,6 +2956,50 @@ path_to_unicode(const struct mg_connection *conn,
 #pragma GCC diagnostic ignored "-Wunused-function"
 #endif
 
+/*
+// Encode 'path' which is assumed UTF-8 string, into UNICODE string.
+// wbuf and wbuf_len is a target buffer and its length.
+*/
+static void to_unicode(const char *path, wchar_t *wbuf, size_t wbuf_len) {
+  char buf[PATH_MAX], buf2[PATH_MAX], *p;
+
+  mg_strlcpy(buf, path, sizeof(buf));
+  change_slashes_to_backslashes(buf);
+
+  /* Point p to the end of the file name */
+  p = buf + strlen(buf) - 1;
+
+  /* Trim trailing backslash character */
+  while (p > buf && *p == '\\' && p[-1] != ':') {
+    *p-- = '\0';
+  }
+
+   /*
+   // Protect from CGI code disclosure.
+   // This is very nasty hole. Windows happily opens files with
+   // some garbage in the end of file name. So fopen("a.cgi    ", "r")
+   // actually opens "a.cgi", and does not return an error!
+   */
+  if (*p == 0x20 ||               /* No space at the end */
+      (*p == 0x2e && p > buf) ||  /* No '.' but allow '.' as full path */
+      *p == 0x2b ||               /* No '+' */
+      (*p & ~0x7f)) {             /* And generally no non-ascii chars */
+    (void) fprintf(stderr, "Rejecting suspicious path: [%s]", buf);
+    wbuf[0] = L'\0';
+  } else {
+    /*
+    // Convert to Unicode and back. If doubly-converted string does not
+    // match the original, something is fishy, reject.
+    */
+    memset(wbuf, 0, wbuf_len * sizeof(wchar_t));
+    MultiByteToWideChar(CP_UTF8, 0, buf, -1, wbuf, (int) wbuf_len);
+    WideCharToMultiByte(CP_UTF8, 0, wbuf, (int) wbuf_len, buf2, sizeof(buf2),
+                        NULL, NULL);
+    if (strcmp(buf, buf2) != 0) {
+      wbuf[0] = L'\0';
+    }
+  }
+}
 
 static time_t
 time(time_t *ptime)
@@ -2935,16 +3021,16 @@ time(time_t *ptime)
 
 
 static struct tm *
-localtime(const time_t *ptime, struct tm *ptm)
+localtime(const time_t *ptime)
 {
 	int64_t t = ((int64_t)*ptime) * RATE_DIFF + EPOCH_DIFF;
 	FILETIME ft, lft;
 	SYSTEMTIME st;
 	TIME_ZONE_INFORMATION tzinfo;
+	static struct tm _tm;
+	struct tm *ptm;
 
-	if (ptm == NULL) {
-		return NULL;
-	}
+	ptm = &_tm;
 
 	*(int64_t *)&ft = t;
 	FileTimeToLocalFileTime(&ft, &lft);
@@ -2963,22 +3049,29 @@ localtime(const time_t *ptime, struct tm *ptm)
 	return ptm;
 }
 
-
 static struct tm *
-gmtime(const time_t *ptime, struct tm *ptm)
+gmtime(const time_t *ptime)
 {
 	/* FIXME(lsm): fix this. */
-	return localtime(ptime, ptm);
+	return localtime(ptime);
 }
-
 
 static size_t
 strftime(char *dst, size_t dst_size, const char *fmt, const struct tm *tm)
 {
-	(void)mg_snprintf(NULL, dst, dst_size, "implement strftime() for WinCE");
-	return 0;
+	extern size_t wceex_strftime(char *s, size_t maxsize, const char *format, const struct tm *tim_p);
+	return wceex_strftime(dst, dst_size, fmt, tm);
 }
 
+static int rename(const char* oldname, const char* newname) {
+  wchar_t woldbuf[PATH_MAX];
+  wchar_t wnewbuf[PATH_MAX];
+
+  to_unicode(oldname, woldbuf, ARRAY_SIZE(woldbuf));
+  to_unicode(newname, wnewbuf, ARRAY_SIZE(wnewbuf));
+
+  return MoveFileW(woldbuf, wnewbuf) ? 0 : -1;
+}
 
 #if defined(__MINGW32__)
 /* Enable unused function warning again */
@@ -3216,10 +3309,12 @@ static void
 set_close_on_exec(SOCKET sock, struct mg_connection *conn /* may be null */)
 {
 	(void)conn; /* Unused. */
+#ifndef _WIN32_WCE
 	(void)SetHandleInformation((HANDLE)(intptr_t)sock, HANDLE_FLAG_INHERIT, 0);
+#endif
 }
 
-
+#ifndef _WIN32_WCE
 int
 mg_start_thread(mg_thread_func_t f, void *p)
 {
@@ -3231,13 +3326,25 @@ mg_start_thread(mg_thread_func_t f, void *p)
 	            ? -1
 	            : 0);
 #else
+#	ifndef _WIN32_WCE
 	return (
 	    (_beginthread((void(__cdecl *)(void *))f, 0, p) == ((uintptr_t)(-1L)))
 	        ? -1
 	        : 0);
+#	else
+	HANDLE handle = CreateThread(
+		NULL, // LPSECURITY_ATTRIBUTES
+		0,    // stack size (0=default)
+		f,    // LPTHREAD_START_ROUTINE
+		p,    // arguments
+		0,    // creation flags (0 = runs immediately)
+		NULL  // thread id
+		);
+	return (handle == NULL) ? -1 : 0;
+#	endif /* _WIN32_WCE */
 #endif /* defined(USE_STACK_SIZE) && (USE_STACK_SIZE > 1) */
 }
-
+#endif
 
 /* Start a thread storing the thread context. */
 static int
@@ -3245,9 +3352,10 @@ mg_start_thread_with_id(unsigned(__stdcall *f)(void *),
                         void *p,
                         pthread_t *threadidptr)
 {
-	uintptr_t uip;
 	HANDLE threadhandle;
 	int result = -1;
+#	ifndef _WIN32_WCE
+	uintptr_t uip;
 
 	uip = _beginthreadex(NULL, 0, (unsigned(__stdcall *)(void *))f, p, 0, NULL);
 	threadhandle = (HANDLE)uip;
@@ -3255,6 +3363,21 @@ mg_start_thread_with_id(unsigned(__stdcall *f)(void *),
 		*threadidptr = threadhandle;
 		result = 0;
 	}
+#else
+	HANDLE handle = CreateThread(
+		NULL, // LPSECURITY_ATTRIBUTES
+		0,    // stack size (0=default)
+		f,    // LPTHREAD_START_ROUTINE
+		p,    // arguments
+		0,    // creation flags (0 = runs immediately)
+		NULL  // thread id
+		);
+	threadhandle = handle;
+	if ((handle != NULL) && (threadidptr != NULL)) {
+		*threadidptr = threadhandle;
+		result = 0;
+	}
+#endif /* _WIN32_WCE */
 
 	return result;
 }
@@ -3911,11 +4034,15 @@ pull(FILE *fp, struct mg_connection *conn, char *buf, int len, double timeout)
 
 	do {
 		if (fp != NULL) {
+#ifdef _WIN32_WCE
+			nread = fread(buf, 1, len, fp);
+#else
 			/* Use read() instead of fread(), because if we're reading from the
 			 * CGI pipe, fread() may block until IO buffer is filled up. We
 			 * cannot afford to block and must pass all read bytes immediately
 			 * to the client. */
 			nread = (int)read(fileno(fp), buf, (size_t)len);
+#endif
 			err = (nread < 0) ? ERRNO : 0;
 
 #ifndef NO_SSL
@@ -4328,8 +4455,9 @@ alloc_vprintf(char **out_buf,
               va_list ap)
 {
 	va_list ap_copy;
-	int len;
+	int len = -1;
 
+#ifndef _WIN32_WCE
 	/* Windows is not standard-compliant, and vsnprintf() returns -1 if
 	 * buffer is too small. Also, older versions of msvcrt.dll do not have
 	 * _vscprintf().  However, if size is 0, vsnprintf() behaves correctly.
@@ -4339,6 +4467,7 @@ alloc_vprintf(char **out_buf,
 	va_copy(ap_copy, ap);
 	len = vsnprintf_impl(NULL, 0, fmt, ap_copy);
 	va_end(ap_copy);
+#endif
 
 	if (len < 0) {
 		/* C runtime is not standard compliant, vsnprintf() returned -1.
@@ -4399,6 +4528,19 @@ mg_printf(struct mg_connection *conn, const char *fmt, ...)
 {
 	va_list ap;
 	int result;
+
+	if (conn == NULL) {
+#ifdef DEBUG
+		mg_cry(conn, "mg_printf: conn is NULL");
+#endif
+		return -1;
+	}
+	if (fmt == NULL) {
+#ifdef DEBUG
+		mg_cry(conn, "mg_printf: fmt is NULL");
+#endif
+		return -1;
+	}
 
 	va_start(ap, fmt);
 	result = mg_vprintf(conn, fmt, ap);
@@ -5310,7 +5452,9 @@ parse_auth_header(struct mg_connection *conn,
 {
 	char *name, *value, *s;
 	const char *auth_header;
+#ifndef NO_NONCE_CHECK
 	uint64_t nonce;
+#endif
 
 	if (!ah || !conn) {
 		return 0;
@@ -5782,7 +5926,7 @@ mg_modify_passwords_file(const char *fname,
 	fclose(fp2);
 
 	/* Put the temp file in place of real file */
-	IGNORE_UNUSED_RESULT(remove(fname));
+	IGNORE_UNUSED_RESULT(mg_remove(NULL, fname));
 	IGNORE_UNUSED_RESULT(rename(tmp, fname));
 
 	return 1;
@@ -6244,7 +6388,9 @@ remove_directory(struct mg_connection *conn, const char *dir)
 		}
 		(void)mg_closedir(dirp);
 
+#ifndef _WIN32_WCE /* TODO */
 		IGNORE_UNUSED_RESULT(rmdir(dir));
+#endif
 	}
 
 	return ok;
@@ -7829,6 +7975,7 @@ put_file(struct mg_connection *conn, const char *path)
 				return;
 			}
 
+#ifndef _WIN32_WCE
 			/* Check if the server may write this file */
 			if (access(path, W_OK) == 0) {
 				/* Access granted */
@@ -7842,6 +7989,11 @@ put_file(struct mg_connection *conn, const char *path)
 				    path);
 				return;
 			}
+#else
+			/* TODO for WINCE */
+			conn->status_code = 200;
+			rc = 1;
+#endif
 		}
 	} else {
 		/* File should be created */
@@ -7970,6 +8122,7 @@ delete_file(struct mg_connection *conn, const char *path)
 
 	/* This is an existing file (not a directory).
 	 * Check if write permission is granted. */
+#ifndef _WIN32_WCE
 	if (access(path, W_OK) != 0) {
 		/* File is read only */
 		send_http_error(
@@ -7979,6 +8132,9 @@ delete_file(struct mg_connection *conn, const char *path)
 		    path);
 		return;
 	}
+#else
+	/* TODO for WINCE */
+#endif
 
 	/* Try to delete it. */
 	if (mg_remove(conn, path) == 0) {
@@ -9257,10 +9413,8 @@ get_remote_ip(const struct mg_connection *conn)
 	return ntohl(*(const uint32_t *)&conn->client.rsa.sin.sin_addr);
 }
 
-
 /* The mg_upload function is superseeded by mg_handle_form_request. */
 #include "handle_form.inl"
-
 
 #if defined(MG_LEGACY_INTERFACE)
 /* Implement the deprecated mg_upload function by calling the new
@@ -10769,7 +10923,9 @@ refresh_trust(struct mg_connection *conn)
 	static int reload_lock = 0;
 	static long int data_check = 0;
 
+#ifndef _WIN32_WCE
 	struct stat cert_buf;
+#endif
 	long int t;
 	char *pem;
 	int should_verify_peer;
@@ -10780,9 +10936,13 @@ refresh_trust(struct mg_connection *conn)
 	}
 
 	t = data_check;
+#ifndef _WIN32_WCE
 	if (stat(pem, &cert_buf) != -1) {
 		t = (long int)cert_buf.st_mtime;
 	}
+#else
+	/* TODO: use GetFileTime */
+#endif
 
 	if (data_check != t) {
 		data_check = t;
@@ -12846,7 +13006,11 @@ get_system_name(char **sysName)
 // GetVersion was declared deprecated
 #pragma warning(disable : 4996)
 #endif
+#ifndef _WIN32_WCE
 	dwVersion = GetVersion();
+#else
+	dwVersion = _WIN32_WCE;
+#endif
 #ifdef _MSC_VER
 #pragma warning(pop)
 #endif
